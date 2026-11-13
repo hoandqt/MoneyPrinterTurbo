@@ -2,6 +2,7 @@ import json
 import math
 import os
 import re
+import shutil
 import socket
 import tempfile
 import threading
@@ -494,6 +495,29 @@ def resolve_custom_audio_file(
     return server_audio_file
 
 
+def resolve_custom_subtitle_file(
+    task_id: str,
+    custom_subtitle_file: str | None,
+) -> str:
+    """Resolve a caller-supplied subtitle file inside the task directory.
+
+    Renderify patch: the same security boundary as the custom audio
+    file — the path must resolve inside storage/tasks/<task_id>/, so
+    an API caller cannot turn it into a read of an arbitrary server
+    file. Returns "" when no subtitle file was supplied; raises
+    ValueError when the path escapes the task directory or the file
+    does not exist.
+    """
+    requested_file = (custom_subtitle_file or "").strip()
+    if not requested_file:
+        return ""
+
+    return file_security.resolve_path_within_directory(
+        utils.task_dir(task_id),
+        requested_file,
+    )
+
+
 def _resolve_reusable_voice_preview(
     task_id: str,
     params,
@@ -652,6 +676,23 @@ def generate_audio(
         return custom_audio_file, audio_duration, None
 
 
+def _resolve_supplied_subtitle(task_id, params) -> str:
+    """Resolve a caller-supplied subtitle file, or "" when there is none.
+
+    Renderify patch: a missing or unresolvable file is a warning, not
+    a failure — the video ships without subtitles, exactly like an
+    Edge subtitle failure. Never fail a video over subtitles.
+    """
+    requested = getattr(params, "custom_subtitle_file", None)
+    if not requested:
+        return ""
+    try:
+        return resolve_custom_subtitle_file(task_id, requested)
+    except ValueError as exc:
+        logger.warning(f"ignoring unresolvable subtitle file {requested!r}: {exc}")
+        return ""
+
+
 def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     """
     Generate subtitle for the video script.
@@ -672,7 +713,15 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         logger.info("subtitle provider is empty, skip subtitle generation")
         return ""
 
-    if sub_maker is None and subtitle_provider != "whisper":
+    # Renderify patch: a caller-supplied subtitle file (SRT) rides next
+    # to a custom audio file — Renderify TTS speaks the script and
+    # returns its timings as an SRT. It is the exact timeline, so it
+    # takes precedence over Whisper transcription below.
+    supplied_subtitle = (
+        _resolve_supplied_subtitle(task_id, params) if sub_maker is None else ""
+    )
+
+    if sub_maker is None and subtitle_provider != "whisper" and not supplied_subtitle:
         # 自定义音频不会经过 TTS，因此没有 Edge/Azure 等 TTS 返回的
         # sub_maker 时间轴。只有 Whisper 可以直接从音频文件转写字幕；
         # 其他字幕提供方继续保持原有行为，避免生成错误的空时间轴。
@@ -686,7 +735,12 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
 
     # A failed retry must never reuse captions from an earlier narration.
     with staged_subtitle_file(final_subtitle_path) as subtitle_path:
-        if subtitle_provider == "edge":
+        if supplied_subtitle:
+            # Copy into the staged path and let the shared tail below
+            # validate + publish it — a failed retry can never publish
+            # a stale SRT.
+            shutil.copyfile(supplied_subtitle, subtitle_path)
+        elif subtitle_provider == "edge":
             voice.create_subtitle(
                 text=video_script,
                 sub_maker=sub_maker,
@@ -704,7 +758,7 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
                 )
                 return ""
 
-        if subtitle_provider == "whisper":
+        elif subtitle_provider == "whisper":
             subtitle.create(
                 audio_file=audio_file,
                 subtitle_file=subtitle_path,
