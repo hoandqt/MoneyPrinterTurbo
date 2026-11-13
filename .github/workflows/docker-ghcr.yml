@@ -21,7 +21,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE_NAME: ghcr.io/harry0703/moneyprinterturbo
+  # Fork packaging: publish to the fork owner's namespace, not upstream's.
+  IMAGE_NAME: ghcr.io/hoandqt/moneyprinterturbo
 
 jobs:
   publish:
