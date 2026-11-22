@@ -1739,6 +1739,16 @@ def generate_video(
             + stroke_padding
         )
 
+        # Background opacity: an explicit percent overrides the branch
+        # defaults (rounded 140/255, plain 255/255); None keeps them,
+        # so older clients render exactly as before.
+        bg_opacity = getattr(params, "subtitle_background_opacity", None)
+        bg_alpha = (
+            max(0, min(255, int(round(bg_opacity * 255 / 100))))
+            if bg_opacity is not None
+            else None
+        )
+
         if rounded_bg_enabled:
             # 圆角背景需要贴合文字宽度，而不是沿用 90% 视频宽度。这里先用
             # PIL 测量最长一行文字，再加水平内边距，避免短字幕出现过宽底板。
@@ -1785,7 +1795,7 @@ def generate_video(
                 width=box_w,
                 height=clip_h,
                 color=bg_color,
-                alpha=140,
+                alpha=bg_alpha if bg_alpha is not None else 140,
                 radius=radius,
             )
             text_position = _get_visible_center_position(text_clip, box_w, clip_h)
@@ -1818,7 +1828,7 @@ def generate_video(
                 width=size[0],
                 height=size[1],
                 color=bg_color,
-                alpha=255,
+                alpha=bg_alpha if bg_alpha is not None else 255,
                 radius=0,
             )
             text_position = _get_visible_center_position(text_clip, size[0], size[1])

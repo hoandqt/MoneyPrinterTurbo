@@ -162,6 +162,10 @@ class VideoParams(BaseModel):
     text_fore_color: Optional[str] = "#FFFFFF"
     text_background_color: Union[bool, str] = False
     rounded_subtitle_background: bool = False
+    # Background opacity, 0-100 percent. None keeps the branch
+    # defaults (rounded 140/255, plain 255/255), so older clients
+    # render exactly as before.
+    subtitle_background_opacity: Optional[int] = Field(default=None, ge=0, le=100)
 
     font_size: int = Field(default=60, ge=1)
     stroke_color: Optional[str] = "#000000"
