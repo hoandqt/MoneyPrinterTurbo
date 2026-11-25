@@ -522,8 +522,17 @@ def transcribe_audio(
 
         # create() returns None on success and ""/None on failure, so
         # the SRT file's existence — not the return value — decides.
+        # Prime Whisper with the pasted lyrics: without them it guesses
+        # the words (and usually guesses wrong on songs), the alignment
+        # in correct() then has nothing to match, and Lyrics mode
+        # silently returns the plain transcription. The prompt is
+        # truncated inside create() to Whisper's ~224-token window.
         subtitle_service.create(
-            audio_path, subtitle_path, word_level=word_level, log_details=False
+            audio_path,
+            subtitle_path,
+            word_level=word_level,
+            log_details=False,
+            initial_prompt=lyrics_text or None,
         )
         if not os.path.isfile(subtitle_path):
             raise HttpException(

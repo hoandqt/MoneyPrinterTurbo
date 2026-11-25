@@ -19,7 +19,21 @@ from app.utils.subtitle_writer import write_subtitle_file
 model_size = config.whisper.get("model_size", "large-v3")
 device = config.whisper.get("device", "cpu")
 compute_type = config.whisper.get("compute_type", "int8")
-initial_prompt = config.whisper.get("initial_prompt", "") or None
+_CONFIG_INITIAL_PROMPT = config.whisper.get("initial_prompt", "") or None
+# Whisper's initial prompt holds about 224 tokens; past that the
+# library truncates it, and which end survives is its choice, not
+# ours. Cut here first — at a line break, inside the budget — so the
+# opening verses (where Whisper currently fails hardest) are the part
+# that gets primed.
+_TRANSCRIBE_MAX_PROMPT_CHARS = 800
+
+
+def _truncate_prompt(text: str) -> str:
+    text = (text or "").strip()
+    if len(text) <= _TRANSCRIBE_MAX_PROMPT_CHARS:
+        return text
+    cut = text.rfind("\n", 0, _TRANSCRIBE_MAX_PROMPT_CHARS)
+    return text[: cut if cut > 0 else _TRANSCRIBE_MAX_PROMPT_CHARS].strip()
 model = None
 _model_init_lock = threading.Lock()
 
@@ -63,6 +77,7 @@ def create(
     subtitle_file: str = "",
     word_level: bool = False,
     log_details: bool = True,
+    initial_prompt: str | None = None,
 ):
     if WhisperModel is None:
         logger.warning("faster_whisper not available, skipping whisper subtitle generation")
@@ -75,13 +90,19 @@ def create(
     if not subtitle_file:
         subtitle_file = f"{audio_file}.srt"
 
+    # A per-call prompt (the pasted lyrics) wins over the configured
+    # one; None means "use the configured prompt", so callers that pass
+    # nothing keep today's behaviour.
+    prompt = initial_prompt if initial_prompt is not None else _CONFIG_INITIAL_PROMPT
+    if prompt:
+        prompt = _truncate_prompt(prompt)
     segments, info = model.transcribe(
         audio_file,
         beam_size=5,
         word_timestamps=True,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=500),
-        **({"initial_prompt": initial_prompt} if initial_prompt else {}),
+        **({"initial_prompt": prompt} if prompt else {}),
     )
 
     logger.info(
