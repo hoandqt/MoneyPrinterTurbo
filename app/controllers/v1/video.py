@@ -2,10 +2,11 @@ import mimetypes
 import os
 import pathlib
 import shutil
+import tempfile
 from typing import Union
 from urllib.parse import quote
 
-from fastapi import BackgroundTasks, Depends, Path, Query, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, Form, Path, Query, Request, UploadFile
 from fastapi.params import File
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from loguru import logger
@@ -35,6 +36,7 @@ from app.models.schema import (
 from app.services import bgm as bgm_service
 from app.services import material_upload as material_upload_service
 from app.services import state as sm
+from app.services import subtitle as subtitle_service
 from app.services import task as tm
 from app.utils import file_security, utils
 
@@ -441,6 +443,122 @@ def upload_bgm_file(request: Request, file: UploadFile = File(...)):
 
     response = {"file": safe_filename}
     return utils.get_response(200, response)
+
+
+_TRANSCRIBE_AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "flac", "ogg"}
+_TRANSCRIBE_MAX_BYTES = 200 * 1024 * 1024
+_TRANSCRIBE_MAX_LYRICS_CHARS = 10000
+
+
+@router.post(
+    "/transcribe",
+    summary="Transcribe an audio file to subtitles",
+    description=(
+        "Transcribe an uploaded audio file with faster-whisper and return "
+        "an SRT file. Pass optional lyrics text to align the exact words "
+        "to the transcription timings instead of Whisper's guessed words."
+    ),
+    responses={
+        400: {"description": "The filename, format, size, or lyrics are invalid"},
+        502: {"description": "Transcription produced no subtitles"},
+        503: {"description": "The Whisper model is unavailable"},
+    },
+)
+def transcribe_audio(
+    request: Request,
+    file: UploadFile = File(...),
+    lyrics: str | None = Form(None),
+    word_level: bool = Form(False),
+):
+    request_id = base.get_task_id(request)
+
+    if subtitle_service.WhisperModel is None:
+        raise HttpException(
+            task_id=request_id,
+            status_code=503,
+            message=f"{request_id}: subtitle transcription is unavailable",
+        )
+
+    filename = (file.filename or "").strip()
+    extension = pathlib.Path(filename).suffix.lower().lstrip(".")
+    if extension not in _TRANSCRIBE_AUDIO_EXTENSIONS:
+        raise HttpException(
+            task_id=request_id,
+            status_code=400,
+            message=f"{request_id}: unsupported audio format (mp3, wav, m4a, flac, ogg only)",
+        )
+
+    lyrics_text = (lyrics or "").strip()
+    if len(lyrics_text) > _TRANSCRIBE_MAX_LYRICS_CHARS:
+        raise HttpException(
+            task_id=request_id,
+            status_code=400,
+            message=f"{request_id}: lyrics must be at most 10000 characters",
+        )
+    # Word-level cues are single words, and the lyrics alignment
+    # matches whole lines — the two never mix, so lyrics mode always
+    # transcribes at sentence level.
+    if lyrics_text:
+        word_level = False
+
+    with tempfile.TemporaryDirectory(prefix="transcribe-") as temp_dir:
+        audio_path = os.path.join(temp_dir, f"audio.{extension}")
+        subtitle_path = os.path.join(temp_dir, "audio.srt")
+
+        written = 0
+        with open(audio_path, "wb") as output:
+            while True:
+                chunk = file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > _TRANSCRIBE_MAX_BYTES:
+                    raise HttpException(
+                        task_id=request_id,
+                        status_code=400,
+                        message=f"{request_id}: audio file must be at most 200 MB",
+                    )
+                output.write(chunk)
+
+        # create() returns None on success and ""/None on failure, so
+        # the SRT file's existence — not the return value — decides.
+        subtitle_service.create(
+            audio_path, subtitle_path, word_level=word_level, log_details=False
+        )
+        if not os.path.isfile(subtitle_path):
+            raise HttpException(
+                task_id=request_id,
+                status_code=502,
+                message=f"{request_id}: transcription produced no subtitles (no speech detected)",
+            )
+
+        if lyrics_text:
+            # Rewrites the SRT in place with the pasted words at
+            # Whisper's timings. When the lyrics outrun the heard
+            # cues it keeps the plain transcription — that is the
+            # documented guard, not an error, so the plain SRT is
+            # still returned below.
+            subtitle_service.correct(subtitle_path, lyrics_text)
+
+        with open(subtitle_path, "r", encoding="utf-8") as subtitle_file:
+            srt = subtitle_file.read()
+
+    if not srt.strip():
+        raise HttpException(
+            task_id=request_id,
+            status_code=502,
+            message=f"{request_id}: transcription produced no subtitles (no speech detected)",
+        )
+
+    srt_name = pathlib.Path(filename).stem or "subtitles"
+    return Response(
+        content=srt,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{srt_name}.srt"'
+        },
+    )
+
 
 @router.get(
     "/video_materials", response_model=VideoMaterialRetrieveResponse, summary="Retrieve local video materials"
