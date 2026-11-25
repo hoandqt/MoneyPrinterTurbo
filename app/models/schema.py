@@ -56,6 +56,7 @@ class VideoFitMode(str, Enum):
 class ImageMotion(str, Enum):
     static = "static"
     zoom = "zoom"
+    pan = "pan"
 
 
 SubtitleDisplayMode = Literal["sentence", "word_by_word"]
@@ -114,6 +115,15 @@ class VideoParams(BaseModel):
     video_aspect: Optional[VideoAspect] = VideoAspect.portrait
     video_fit_mode: VideoFitMode = VideoFitMode.cover
     image_motion: ImageMotion = ImageMotion.zoom
+    # Zoom direction for image_motion=zoom: "in" (today's look), "out"
+    # (starts closer, pulls back to full frame), or "random" (each scene
+    # rolls its own). Pan direction for image_motion=pan: "left",
+    # "right", "up", "down", or "random" (each scene rolls its own).
+    # Amount is the TOTAL movement over the clip as a percentage
+    # (0-30, default 3).
+    image_zoom_direction: str = "in"
+    image_motion_direction: str = "random"
+    image_motion_amount: int = Field(default=3, ge=0, le=30)
     video_concat_mode: Optional[VideoConcatMode] = VideoConcatMode.random
     video_transition_mode: Optional[VideoTransitionMode] = None
     video_clip_duration: int = Field(default=5, ge=1)

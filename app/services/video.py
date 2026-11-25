@@ -2023,9 +2023,9 @@ def generate_video(
 _ZOOM_CACHE_TAG = "-smooth"
 
 
-def _smooth_zoom_clip(clip, zoom_amount: float):
+def _smooth_zoom_clip(clip, zoom_amount: float, direction: str = "in"):
     """
-    以亚像素精度生成缓慢放大的片段，画布尺寸保持不变。
+    以亚像素精度生成缓慢放大或缩小的片段，画布尺寸保持不变。
 
     旧实现 `clip.resized(lambda t: ...)` 每帧把图片缩放到整数尺寸，再按整数
     偏移居中裁切。放大速度很慢时（每秒约 3%），相邻帧的尺寸要么不变、要么
@@ -2035,6 +2035,10 @@ def _smooth_zoom_clip(clip, zoom_amount: float):
     这里固定输出尺寸，每帧以图片中心为原点做仿射变换（BICUBIC 插值），
     缩放比例随时间连续变化。构图与旧实现一致：从原图开始，以中心为基准
     放大并裁掉超出画布的部分。带透明通道的图片同样处理遮罩。
+
+    direction="in" 从原图开始放大到 1+amount；direction="out" 从
+    1+amount 开始缩小回原图 —— 画面在每一帧都保持满幅，绝不露出画布
+    外的空白。
     """
     base = Image.fromarray(np.asarray(clip.get_frame(0)).astype("uint8"))
     width, height = base.size
@@ -2045,9 +2049,11 @@ def _smooth_zoom_clip(clip, zoom_amount: float):
         mask_frame = np.asarray(clip.mask.get_frame(0)) * 255
         mask_base = Image.fromarray(mask_frame.clip(0, 255).astype("uint8"))
 
+    zoom_out = direction == "out"
+
     def warp(image, t, resample):
         progress = min(max(t, 0.0), duration) / duration
-        scale = 1.0 + zoom_amount * progress
+        scale = 1.0 + zoom_amount * (1.0 - progress if zoom_out else progress)
         # 输出像素 (x, y) 取自原图 (cx + (x - cx) / s, cy + (y - cy) / s)。
         coefficients = (
             1 / scale, 0, center_x - center_x / scale,
@@ -2070,27 +2076,111 @@ def _smooth_zoom_clip(clip, zoom_amount: float):
     return zoomed.with_position("center")
 
 
+def _smooth_pan_clip(clip, direction: str, amount_fraction: float):
+    """
+    以亚像素精度生成平移片段，画布尺寸保持不变。
+
+    图片先按 (1 + amount) 放大，再让满幅窗口在放大后的图片上沿指定方向
+    平移：窗口在每一帧都完整落在图片之内，绝不露出画布外的空白。
+    direction 命名窗口的行进方向：left = 窗口从右边缘出发，移到左边缘；
+    right、up、down 同理。amount 为窗口在行进轴上的总行程占画幅的比例。
+    """
+    base = Image.fromarray(np.asarray(clip.get_frame(0)).astype("uint8"))
+    width, height = base.size
+    center_x, center_y = width / 2.0, height / 2.0
+    duration = clip.duration or 1.0
+    mask_base = None
+    if clip.mask is not None:
+        mask_frame = np.asarray(clip.mask.get_frame(0)) * 255
+        mask_base = Image.fromarray(mask_frame.clip(0, 255).astype("uint8"))
+
+    scale = 1.0 + max(0.0, amount_fraction)
+    # 窗口中心在源图上的最大偏移：放大后图片比画布多出的部分的一半。
+    max_offset_x = (width - width / scale) / 2.0
+    max_offset_y = (height - height / scale) / 2.0
+
+    def warp(image, t, resample):
+        progress = min(max(t, 0.0), duration) / duration
+        # progress 0 -> +max（窗口在行进方向的起点一侧），1 -> -max。
+        travel = 1.0 - 2.0 * progress
+        offset_x, offset_y = 0.0, 0.0
+        if direction == "left":
+            offset_x = max_offset_x * travel
+        elif direction == "right":
+            offset_x = -max_offset_x * travel
+        elif direction == "up":
+            offset_y = max_offset_y * travel
+        elif direction == "down":
+            offset_y = -max_offset_y * travel
+        coefficients = (
+            1 / scale, 0, center_x - center_x / scale + offset_x,
+            0, 1 / scale, center_y - center_y / scale + offset_y,
+        )
+        return image.transform(
+            (width, height), Image.AFFINE, coefficients, resample=resample
+        )
+
+    panned = VideoClip(
+        lambda t: np.asarray(warp(base, t, Image.BICUBIC)), duration=clip.duration
+    )
+    if mask_base is not None:
+        mask = VideoClip(
+            lambda t: np.asarray(warp(mask_base, t, Image.BILINEAR)) / 255.0,
+            is_mask=True,
+            duration=clip.duration,
+        )
+        panned = panned.with_mask(mask)
+    return panned.with_position("center")
+
+
 def render_image_zoom_video(
-    image_path: str, clip_duration: int = 5, image_motion: ImageMotion = ImageMotion.zoom
+    image_path: str, clip_duration: int = 5, image_motion: ImageMotion = ImageMotion.zoom,
+    zoom_direction: str = "in", motion_direction: str = "random",
+    motion_amount: int = 3,
 ) -> str:
     """
-    将单张图片渲染为静止或缓慢放大的 mp4 片段，返回输出文件路径。
+    将单张图片渲染为静止、缓慢缩放或平移的 mp4 片段，返回输出文件路径。
 
     local 素材预处理和 OpenAI 兼容文生图素材共用这段"图片 → 片段"渲染
-    逻辑：默认保留每秒约 3% 的动态放大，静止模式只固定播放时长。
+    逻辑：默认保留缓慢的动态，静止模式只固定播放时长。
     此设置与片段转场独立。渲染异常由调用方按各自素材源的失败约定处理。
+
+    motion_amount 是整个片段的总运动幅度（百分比）：缩放时首尾帧的尺寸差，
+    平移时窗口的总行程。zoom_direction="random" 和 motion_direction="random"
+    在每次渲染时各 roll 一次方向，所以同一张图循环使用时每次的方向都可能
+    不同 —— 解析后的方向会写进输出文件名，避免后一次渲染覆盖前一次。
     """
     motion = ImageMotion(image_motion)
+    # 方向字段由调用方（API 层 Pydantic + TOOLS 校验器）保证合法；直接调用
+    # 也要宽容处理，非法值回落到默认值而不是让任务崩溃。
+    zoom_direction = str(zoom_direction or "in").lower()
+    if zoom_direction not in ("in", "out", "random"):
+        zoom_direction = "in"
+    if zoom_direction == "random":
+        zoom_direction = random.choice(["in", "out"])
+    motion_direction = str(motion_direction or "random").lower()
+    if motion_direction not in ("left", "right", "up", "down", "random"):
+        motion_direction = "random"
+    if motion_direction == "random":
+        motion_direction = random.choice(["left", "right", "up", "down"])
+    try:
+        motion_amount = int(motion_amount)
+    except (TypeError, ValueError):
+        motion_amount = 3
+    motion_amount = max(0, min(30, motion_amount))
+    amount_fraction = motion_amount / 100.0
+
     clip, _ = _open_image_clip_with_fallback(image_path)
     clip = clip.with_duration(clip_duration).with_position("center")
     temp_path = ""
     try:
-        # 放大模式以亚像素精度逐帧放大，静止模式保留原始构图及透明背景处理。
-        image_clip = (
-            _smooth_zoom_clip(clip, clip_duration * 0.03)
-            if motion == ImageMotion.zoom
-            else clip
-        )
+        # 缩放/平移模式以亚像素精度逐帧变换，静止模式保留原始构图及透明背景处理。
+        if motion == ImageMotion.zoom:
+            image_clip = _smooth_zoom_clip(clip, amount_fraction, zoom_direction)
+        elif motion == ImageMotion.pan:
+            image_clip = _smooth_pan_clip(clip, motion_direction, amount_fraction)
+        else:
+            image_clip = clip
 
         # Optionally, create a composite video clip containing the zoomed clip.
         # This is useful if you want to add other elements to the video.
@@ -2108,9 +2198,18 @@ def render_image_zoom_video(
             source_identity = source_digest.hexdigest()
             duration_identity = hashlib.sha256(str(clip_duration).encode()).hexdigest()[:16]
             motion_tag = _ZOOM_CACHE_TAG if motion == ImageMotion.zoom else ""
+            # 解析后的方向和幅度也是渲染内容的一部分：同一张图以不同方向
+            # 或幅度渲染时必须落在不同文件，否则后一次会覆盖前一次（循环
+            # 使用同一张图、random 方向每次都不同时尤其如此）。
+            if motion == ImageMotion.zoom:
+                params_tag = f"-z{zoom_direction}-a{motion_amount}"
+            elif motion == ImageMotion.pan:
+                params_tag = f"-p{motion_direction}-a{motion_amount}"
+            else:
+                params_tag = ""
             video_file = os.path.join(
                 os.path.dirname(image_path),
-                f"{source_identity}.{motion.value}{motion_tag}-{duration_identity}.mp4",
+                f"{source_identity}.{motion.value}{motion_tag}{params_tag}-{duration_identity}.mp4",
             )
             descriptor, temp_path = tempfile.mkstemp(
                 prefix=".image-zoom-",

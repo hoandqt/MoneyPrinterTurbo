@@ -46,6 +46,7 @@ _api_key_lock = threading.Lock()
 # A provider URL can point to an unexpectedly large object or never-ending stream.
 # Short stock and generated clips should stay well below this conservative cap.
 MAX_VIDEO_DOWNLOAD_BYTES = 512 * 1024 * 1024
+_MAX_IMAGE_DOWNLOAD_BYTES = 50 * 1024 * 1024
 
 # 默认保持串行，与旧版行为一致；有需要时可在配置中提高库存素材并发数。
 _DEFAULT_MATERIAL_CONCURRENCY = 1
@@ -640,6 +641,141 @@ def search_videos_pixabay(
         error_message = _redact_request_error(e, api_key)
         logger.error(
             "pixabay search request failed: "
+            f"error={type(e).__name__}, detail={error_message}"
+        )
+
+    return []
+
+
+def search_images_pixabay(
+    search_term: str,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+) -> List[MaterialInfo]:
+    """Search Pixabay for still photos, mirroring search_videos_pixabay.
+
+    Same key, same Cloudflare-challenge / 429 / >=400 handling (log and
+    return []). Images endpoint with image_type=photo and per_page=50.
+    Each MaterialInfo carries the largeImageURL — the 9:16 crop needs
+    the largest file, not the small webformatURL — plus the image
+    dimensions in source_info.rendition so the aspect filter can
+    verify orientation locally. Duration is 0: stills have no length;
+    the pixabay_images branch counts each rendered clip at
+    max_clip_duration instead.
+    """
+    aspect = VideoAspect(video_aspect)
+
+    api_key = get_api_key("pixabay_api_keys")
+    # Pixabay orientation values are "horizontal"/"vertical" (not the
+    # "landscape"/"portrait" Pexels uses). Square outputs skip the
+    # filter and let the compose stage crop, like the video search.
+    params = {
+        "q": search_term,
+        "image_type": "photo",
+        "per_page": 50,
+        "key": api_key,
+    }
+    if aspect == VideoAspect.portrait:
+        params["orientation"] = "vertical"
+    elif aspect == VideoAspect.landscape:
+        params["orientation"] = "horizontal"
+    query_url = f"https://pixabay.com/api/?{urlencode(params)}"
+    logger.info(
+        f"searching images on pixabay: term={search_term!r}, "
+        f"proxy_enabled={bool(config.proxy)}"
+    )
+
+    try:
+        r = trace_http_call(
+            "GET", requests.get,
+            query_url, proxies=config.proxy, verify=_get_tls_verify(), timeout=(30, 60)
+        )
+        status_code = int(getattr(r, "status_code", 200))
+        headers = getattr(r, "headers", {}) or {}
+        content_type = str(headers.get("content-type", ""))
+        retry_after = headers.get("retry-after")
+        cf_ray = headers.get("cf-ray")
+
+        if _is_cloudflare_challenge(r):
+            logger.error(
+                "pixabay image search was blocked by a Cloudflare challenge: "
+                f"status={status_code}, cf_ray={cf_ray or 'unknown'}. "
+                "Check the server network or proxy, or use Pexels/Coverr instead."
+            )
+            return []
+
+        if status_code == 429:
+            logger.error(
+                "pixabay API rate limit exceeded: "
+                f"status=429, retry_after={retry_after or 'unknown'}"
+            )
+            return []
+
+        if status_code >= 400:
+            logger.error(
+                "pixabay image search request failed: "
+                f"status={status_code}, content_type={content_type or 'unknown'}"
+            )
+            return []
+
+        try:
+            response = r.json()
+        except ValueError:
+            logger.error(
+                "pixabay returned an unexpected non-JSON response: "
+                f"status={status_code}, content_type={content_type or 'unknown'}"
+            )
+            return []
+
+        image_items = []
+        if not isinstance(response, dict) or not isinstance(
+            response.get("hits"), list
+        ):
+            logger.error("pixabay image search returned an unsupported response")
+            return image_items
+        for hit in response["hits"]:
+            if not isinstance(hit, dict):
+                continue
+            image_url = hit.get("largeImageURL")
+            if not isinstance(image_url, str) or not image_url:
+                continue
+            try:
+                w = int(hit["imageWidth"])
+                h = int(hit["imageHeight"])
+            except (KeyError, OverflowError, TypeError, ValueError):
+                continue
+            # Pixabay 很少返回原生方形图片；1:1 输出继续接受满足分辨率的
+            # 候选并由合成阶段裁剪，与视频搜索的方形行为一致。
+            if aspect != VideoAspect.square and not _matches_video_aspect(w, h, aspect):
+                continue
+            item = MaterialInfo()
+            item.provider = "pixabay"
+            item.url = image_url
+            item.duration = 0
+            item.source_info = {
+                "provider": "pixabay",
+                "search_term": search_term,
+                "asset_id": (
+                    str(hit.get("id")) if hit.get("id") is not None else None
+                ),
+                "source_page": _safe_public_url(hit.get("pageURL")),
+                "creator": _creator_info(
+                    {
+                        "id": hit.get("user_id"),
+                        "name": hit.get("user"),
+                    }
+                ),
+                "rendition": {
+                    "id": "large",
+                    "width": w,
+                    "height": h,
+                },
+            }
+            image_items.append(item)
+        return image_items
+    except Exception as e:
+        error_message = _redact_request_error(e, api_key)
+        logger.error(
+            "pixabay image search request failed: "
             f"error={type(e).__name__}, detail={error_message}"
         )
 
@@ -2048,6 +2184,285 @@ def _download_videos_openai_image_on_demand(
     return video_paths
 
 
+def _save_pixabay_image(image_url: str, save_dir: str = "") -> str:
+    """Download a Pixabay still to a local file, mirroring save_video.
+
+    Same streaming pattern (temp file, atomic publish, 50 MB cap), but
+    the file keeps its image extension and is validated as an image
+    with PIL instead of as a video. A cached copy is reused only when
+    it still opens as a valid image.
+    """
+    generation_progress.downloading()
+    if not save_dir:
+        save_dir = utils.storage_dir("cache_videos")
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    url_hash = utils.md5(image_url.split("#", 1)[0])
+    suffix = Path(urlsplit(image_url).path).suffix.lower()
+    if suffix not in (".jpg", ".jpeg", ".png", ".webp"):
+        suffix = ".jpg"
+    image_id = f"img-{url_hash}"
+    image_path = f"{save_dir}/{image_id}{suffix}"
+
+    def _is_valid_image_file(path: str) -> bool:
+        try:
+            with Image.open(path) as image:
+                image.verify()
+            return True
+        except (OSError, UnidentifiedImageError, ValueError):
+            return False
+
+    try:
+        cached_stat = os.stat(image_path)
+    except FileNotFoundError:
+        cached_stat = None
+    if cached_stat is not None and cached_stat.st_size > 0:
+        if _is_valid_image_file(image_path):
+            logger.info(f"image already exists: {image_path}")
+            return image_path
+        logger.warning(f"discarding invalid cached image: {image_path}")
+        try:
+            os.remove(image_path)
+        except FileNotFoundError:
+            pass
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+    }
+
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{image_id}-",
+            suffix=suffix,
+            dir=save_dir,
+            delete=False,
+        ) as temp_file:
+            temp_path = temp_file.name
+            with trace_http_call(
+                "GET", requests.get,
+                image_url,
+                headers=headers,
+                proxies=config.proxy,
+                verify=_get_tls_verify(),
+                timeout=(60, 240),
+                stream=True,
+            ) as response:
+                response.raise_for_status()
+                response_headers = getattr(response, "headers", {}) or {}
+                try:
+                    declared_size = int(response_headers.get("Content-Length", ""))
+                except (TypeError, ValueError):
+                    declared_size = 0
+                if declared_size > _MAX_IMAGE_DOWNLOAD_BYTES:
+                    raise ValueError("image download exceeds 50 MB limit")
+
+                downloaded_bytes = 0
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        downloaded_bytes += len(chunk)
+                        if downloaded_bytes > _MAX_IMAGE_DOWNLOAD_BYTES:
+                            raise ValueError("image download exceeds 50 MB limit")
+                        temp_file.write(chunk)
+
+        if os.path.getsize(temp_path) == 0:
+            return ""
+        if not _is_valid_image_file(temp_path):
+            return ""
+
+        os.replace(temp_path, image_path)
+        temp_path = ""
+        return image_path
+    finally:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except FileNotFoundError:
+                pass
+            except OSError as remove_error:
+                logger.warning(
+                    f"failed to remove temporary image file: {temp_path}, "
+                    f"error: {str(remove_error)}"
+                )
+
+
+def _render_pixabay_image_video(
+    image_path: str,
+    clip_duration: int,
+    image_motion: ImageMotion = ImageMotion.zoom,
+    zoom_direction: str = "in",
+    motion_direction: str = "random",
+    motion_amount: int = 3,
+) -> str:
+    """
+    把下载的 Pixabay 图片渲染成 mp4 片段，复用 local 素材的"图片 → 动态片段"管线。
+
+    渲染失败返回空字符串，由调用方跳过这张图继续下一张。
+    """
+    try:
+        return video.render_image_zoom_video(
+            image_path,
+            clip_duration,
+            image_motion=image_motion,
+            zoom_direction=zoom_direction,
+            motion_direction=motion_direction,
+            motion_amount=motion_amount,
+        )
+    except Exception as e:
+        logger.error(
+            "failed to render pixabay image as a video clip: "
+            f"image={image_path}, error={type(e).__name__}, detail={e}"
+        )
+        return ""
+
+
+def _download_videos_pixabay_images_on_demand(
+    *,
+    task_id: str,
+    search_terms: List[str],
+    video_aspect: VideoAspect,
+    audio_duration: float,
+    max_clip_duration: int,
+    material_directory: str,
+    image_motion: ImageMotion = ImageMotion.zoom,
+    zoom_direction: str = "in",
+    motion_direction: str = "random",
+    motion_amount: int = 3,
+) -> List[str]:
+    """
+    按脚本片段顺序逐张取回 Pixabay 图片素材，凑够所需总时长立即停止。
+
+    与 OpenAI 文生图分支相同的按需语义：每张图片下载后立即渲染成 mp4
+    片段并累计有效时长，累计达到所需配音时长后不再搜索更多关键词。
+    库存图片不按张计费，单张下载或渲染失败只跳过这张图，不终止任务。
+    找到的图片不够时按顺序循环使用，直到凑够时长；一张都没找到时返回
+    空列表，任务层据此把任务标为失败（TOOLS 侧随即退款）。
+    """
+    image_motion = ImageMotion(image_motion)
+    if not material_directory:
+        material_directory = utils.task_dir(task_id)
+
+    video_paths: List[str] = []
+    material_sources: list[dict[str, Any]] = []
+    total_duration = 0.0
+
+    try:
+        required_duration = float(audio_duration)
+    except (TypeError, ValueError):
+        required_duration = 0.0
+    if required_duration <= 0:
+        logger.warning(
+            "skip pixabay image download because required audio duration is "
+            f"not positive: duration={audio_duration}"
+        )
+        _persist_material_sources(task_id, material_sources)
+        return video_paths
+
+    # （图片路径，来源记录）—— 循环使用时按此顺序重新渲染；random 方向
+    # 每次渲染都会重新 roll，解析后的方向写进文件名，不会互相覆盖。
+    rendered_items: List[tuple[str, MaterialInfo]] = []
+
+    def render_item(item: MaterialInfo) -> None:
+        nonlocal total_duration
+        try:
+            image_path = _save_pixabay_image(item.url, material_directory)
+        except Exception as e:
+            logger.warning(
+                "failed to download pixabay image, skip it: "
+                f"provider=pixabay, error={type(e).__name__}, "
+                f"detail={_redact_request_error(e, item.url)}"
+            )
+            return
+        if not image_path:
+            logger.warning(f"pixabay image download returned nothing, skip it: {item.url}")
+            return
+        video_file = _render_pixabay_image_video(
+            image_path,
+            max_clip_duration,
+            image_motion=image_motion,
+            zoom_direction=zoom_direction,
+            motion_direction=motion_direction,
+            motion_amount=motion_amount,
+        )
+        if not video_file:
+            return
+        logger.info(f"image material rendered: {video_file}")
+        video_paths.append(video_file)
+        rendered_items.append((image_path, item))
+        try:
+            material_sources.append(_material_source_record(item, video_file))
+        except Exception as source_error:
+            logger.warning(
+                "failed to prepare pixabay material source record: "
+                f"provider=pixabay, "
+                f"error={type(source_error).__name__}, detail={source_error}"
+            )
+        total_duration += max_clip_duration
+        if total_duration >= required_duration:
+            logger.info(
+                "pixabay image materials cover the required duration, stop "
+                f"searching more images: rendered={total_duration:.1f}s, "
+                f"required={required_duration:.1f}s"
+            )
+
+    for search_term in search_terms:
+        items = search_images_pixabay(search_term, video_aspect)
+        for item in items:
+            render_item(item)
+            if total_duration >= required_duration:
+                break
+        if total_duration >= required_duration:
+            break
+
+    # 图片不够时循环使用已找到的图片，直到凑够时长。
+    if total_duration < required_duration and rendered_items:
+        logger.info(
+            "pixabay images are fewer than needed, looping them in order: "
+            f"rendered={total_duration:.1f}s, required={required_duration:.1f}s"
+        )
+        while total_duration < required_duration:
+            progressed = False
+            for image_path, item in rendered_items:
+                video_file = _render_pixabay_image_video(
+                    image_path,
+                    max_clip_duration,
+                    image_motion=image_motion,
+                    zoom_direction=zoom_direction,
+                    motion_direction=motion_direction,
+                    motion_amount=motion_amount,
+                )
+                if not video_file:
+                    continue
+                progressed = True
+                video_paths.append(video_file)
+                try:
+                    material_sources.append(_material_source_record(item, video_file))
+                except Exception as source_error:
+                    logger.warning(
+                        "failed to prepare pixabay material source record: "
+                        f"provider=pixabay, "
+                        f"error={type(source_error).__name__}, detail={source_error}"
+                    )
+                total_duration += max_clip_duration
+                if total_duration >= required_duration:
+                    break
+            if not progressed:
+                # 循环一整轮都没渲染出任何片段：剩下的图全部失效，继续
+                # 循环只会空转，直接停下，把已有的片段交给任务层。
+                logger.warning(
+                    "pixabay image loop rendered nothing, stop looping: "
+                    f"rendered={total_duration:.1f}s, "
+                    f"required={required_duration:.1f}s"
+                )
+                break
+
+    logger.success(f"downloaded and rendered {len(video_paths)} pixabay image materials")
+    _persist_material_sources(task_id, material_sources)
+    return video_paths
+
+
 def _search_videos_with_cache(
     provider: str,
     search_videos: Callable[..., List[MaterialInfo]],
@@ -2389,6 +2804,9 @@ def download_videos(
     match_script_order: bool = False,
     progress_callback: Callable[[float], None] | None = None,
     image_motion: ImageMotion = ImageMotion.zoom,
+    zoom_direction: str = "in",
+    motion_direction: str = "random",
+    motion_amount: int = 3,
     jalapeno_video_endpoint: volcengine_seedance.SeedanceEndpoint | None = None,
     codex_image_context=None,
 ) -> List[str]:
@@ -2517,6 +2935,21 @@ def download_videos(
             material_directory=material_directory,
             image_motion=image_motion,
             **image_options,
+        )
+    if source == "pixabay_images":
+        # 与 OpenAI 文生图分支相同的按需语义：逐张取图、凑够时长即停；
+        # 库存图片不按张计费，单张失败只跳过，不终止任务。
+        return _download_videos_pixabay_images_on_demand(
+            task_id=task_id,
+            search_terms=search_terms,
+            video_aspect=video_aspect,
+            audio_duration=audio_duration,
+            max_clip_duration=max_clip_duration,
+            material_directory=material_directory,
+            image_motion=image_motion,
+            zoom_direction=zoom_direction,
+            motion_direction=motion_direction,
+            motion_amount=motion_amount,
         )
 
     # Normalized as combine_videos() normalizes it.

@@ -101,7 +101,7 @@ _VIDEO_MUSIC_PROVIDERS = {
 
 
 _SUPPORTED_VIDEO_SOURCES = frozenset({
-    "pexels", "pixabay", "coverr", "local", "wavespeed",
+    "pexels", "pixabay", "pixabay_images", "coverr", "local", "wavespeed",
     "volcengine_seedance", "ofox", "metaso_minimax", "muapi",
     "loomloom", "openai_image", "codex_image", "infistar", "jalapeno",
 })
@@ -893,6 +893,9 @@ def get_video_materials(
                 clip_speed=params.video_clip_speed,
                 match_script_order=params.match_materials_to_script,
                 image_motion=params.image_motion,
+                zoom_direction=params.image_zoom_direction,
+                motion_direction=params.image_motion_direction,
+                motion_amount=params.image_motion_amount,
                 # 素材阶段占用 40%~50%：每下完一个文件推进一次，慢速网络下
                 # 进度条不再长时间停在 40%。
                 progress_callback=_stage_progress_reporter(task_id, 40, 50),
