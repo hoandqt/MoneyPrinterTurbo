@@ -34,6 +34,12 @@ def _write_json_atomic(target: Path, payload: Mapping[str, Any]) -> None:
     本地文件系统和 Docker 挂载目录中保持原子替换语义。写入成功前不会修改
     现有文件；异常时只清理本次创建的临时文件，并把错误交给调用方决定是否
     影响主流程。
+
+    写入后把权限放宽到 0644：任务目录经 bind mount 与 PHP 应用共享，
+    sidecar 以 root 运行而 PHP worker 以 www-data 运行；临时文件默认是
+    0600，不放宽的话 PHP 读不到 script.json，素材审核会在
+    getReviewData 失败（"has no footage list for this task yet"），尽管
+    任务本身已经完成。chmod 失败只记警告，不推翻已成功的写入。
     """
     temp_path: Path | None = None
     try:
@@ -59,6 +65,13 @@ def _write_json_atomic(target: Path, payload: Mapping[str, Any]) -> None:
 
         os.replace(temp_path, target)
         temp_path = None
+        try:
+            os.chmod(target, 0o644)
+        except OSError as exc:
+            logger.warning(
+                f"failed to make task file world-readable: "
+                f"target={target}, error={type(exc).__name__}, detail={exc}"
+            )
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
