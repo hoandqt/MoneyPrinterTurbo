@@ -220,6 +220,23 @@ def create_video(
     return create_task(request, body, stop_at="video")
 
 
+@router.post(
+    "/videos/materials",
+    response_model=TaskResponse,
+    summary="Fetch footage only (for review before render)",
+)
+def create_materials(
+    background_tasks: BackgroundTasks, request: Request, body: TaskVideoRequest
+):
+    # Thin wrapper: task.start() already stops after the materials stage
+    # for stop_at="materials" and marks the task complete with the
+    # downloaded clips. Renderify uses this for its footage-review step:
+    # phase 1 fetches footage, the user approves it, and phase 2 renders
+    # with video_source="local" (a new task — a completed materials task
+    # cannot be resumed into a render).
+    return create_task(request, body, stop_at="materials")
+
+
 @router.post("/subtitle", response_model=TaskResponse, summary="Generate subtitle only")
 def create_subtitle(
     background_tasks: BackgroundTasks, request: Request, body: SubtitleRequest
