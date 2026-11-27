@@ -1390,6 +1390,29 @@ def _is_valid_video_file(video_path: str) -> bool:
                 )
 
 
+def _ensure_world_readable(path: str) -> None:
+    """
+    Best-effort chmod 0644 for a file the PHP app must read.
+
+    The task dir is shared with the PHP app over a bind mount, the
+    sidecar runs as root and the PHP worker as www-data. Downloads
+    stream through tempfile.NamedTemporaryFile (0600) and os.replace
+    keeps that mode, so without this the PHP worker cannot copy a
+    cached clip into a review holding dir and staging fails with
+    "Could not stage the footage for review." Cache hits reuse files
+    written before this fix, so the chmod also runs on the cache-hit
+    path — otherwise the next run would fail on the same 0600 files.
+    A chmod failure only warns; it never fails the download.
+    """
+    try:
+        os.chmod(path, 0o644)
+    except OSError as exc:
+        logger.warning(
+            f"failed to make cached file world-readable: "
+            f"path={path}, error={type(exc).__name__}, detail={exc}"
+        )
+
+
 def save_video(video_url: str, save_dir: str = "") -> str:
     generation_progress.downloading()
     if not save_dir:
@@ -1425,9 +1448,11 @@ def save_video(video_url: str, save_dir: str = "") -> str:
                 f"video cache validation unavailable; preserving existing file: "
                 f"{video_path} => {str(exc)}"
             )
+            _ensure_world_readable(video_path)
             return video_path
         if cached_video_is_valid:
             logger.info(f"video already exists: {video_path}")
+            _ensure_world_readable(video_path)
             return video_path
 
         logger.warning(f"discarding invalid cached video: {video_path}")
@@ -1519,6 +1544,7 @@ def save_video(video_url: str, save_dir: str = "") -> str:
 
         os.replace(temp_path, video_path)
         temp_path = ""
+        _ensure_world_readable(video_path)
         return video_path
     finally:
         if temp_path:
@@ -2220,6 +2246,7 @@ def _save_pixabay_image(image_url: str, save_dir: str = "") -> str:
     if cached_stat is not None and cached_stat.st_size > 0:
         if _is_valid_image_file(image_path):
             logger.info(f"image already exists: {image_path}")
+            _ensure_world_readable(image_path)
             return image_path
         logger.warning(f"discarding invalid cached image: {image_path}")
         try:
@@ -2274,6 +2301,7 @@ def _save_pixabay_image(image_url: str, save_dir: str = "") -> str:
 
         os.replace(temp_path, image_path)
         temp_path = ""
+        _ensure_world_readable(image_path)
         return image_path
     finally:
         if temp_path:
