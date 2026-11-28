@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Any, List, Literal, Optional, Union
 
 import pydantic
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.config import config
 
@@ -94,6 +94,38 @@ class MaterialInfo:
     source_info: Optional[dict[str, Any]] = None
 
 
+class SceneTimelineItem(BaseModel):
+    """One scene of a scene-timeline render (Renderify Scene
+    Templates): an exact duration filled by an uploaded local
+    file, or left empty on a solid background color. The file is
+    a bare filename resolved under storage/local_videos, like
+    video_materials urls."""
+
+    scene_id: str
+    duration_ms: int = Field(ge=1)
+    source: Literal["stock", "empty"]
+    file: Optional[str] = None
+    background_color: str = Field(default="#000000", pattern=r"^#[0-9a-fA-F]{6}$")
+
+    @model_validator(mode="after")
+    def _check_file_matches_source(self):
+        if self.source == "stock":
+            name = (self.file or "").strip()
+            if (
+                not name
+                or "/" in name
+                or "\\" in name
+                or ".." in name
+            ):
+                raise ValueError(
+                    "stock scenes require a bare local filename in file"
+                )
+            self.file = name
+        elif self.file is not None:
+            raise ValueError("empty scenes must not carry a file")
+        return self
+
+
 class VideoParams(BaseModel):
     """
     {
@@ -134,6 +166,13 @@ class VideoParams(BaseModel):
     video_source: Optional[str] = "pexels"
     video_materials: Optional[List[MaterialInfo]] = (
         None  # Materials used to generate the video
+    )
+    # Scene-timeline render (Renderify Scene Templates): when
+    # present, scenes render at their exact durations in order
+    # and video_materials ordering is ignored (the files still
+    # arrive through video_materials' local intake).
+    scene_timeline: Optional[List[SceneTimelineItem]] = Field(
+        default=None, min_length=1
     )
 
     custom_audio_file: Optional[str] = (
