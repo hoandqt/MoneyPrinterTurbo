@@ -1326,6 +1326,260 @@ def combine_videos(
     return combined_video_path
 
 
+_SCENE_TIMELINE_FPS = 30
+
+
+def _scene_frame_counts(durations_ms: List[int]) -> List[int]:
+    """Exact per-scene frame counts at 30fps via cumulative
+    rounding: each scene ends at round(cum_ms * 30 / 1000), so
+    rounding never drifts across the timeline."""
+    counts = []
+    cum_ms = 0
+    prev_end = 0
+    for duration_ms in durations_ms:
+        cum_ms += int(duration_ms)
+        end_frame = round(cum_ms * _SCENE_TIMELINE_FPS / 1000)
+        counts.append(end_frame - prev_end)
+        prev_end = end_frame
+    return counts
+
+
+def _scene_fit_filter(width: int, height: int, fit_mode: VideoFitMode) -> str:
+    if fit_mode == VideoFitMode.contain:
+        return (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
+        )
+    return (
+        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height}"
+    )
+
+
+def _run_scene_ffmpeg(command: list[str], scene_id: str, timeout_seconds: float):
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"scene {scene_id}: ffmpeg exceeded {timeout_seconds:g} seconds"
+        ) from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        raise RuntimeError(
+            f"scene {scene_id}: ffmpeg failed: {detail[-1] if detail else 'unknown error'}"
+        )
+
+
+def _render_scene_segment(
+    scene,
+    frames: int,
+    *,
+    segment_path: str,
+    width: int,
+    height: int,
+    fit_mode: VideoFitMode,
+    image_motion: ImageMotion,
+    image_zoom_direction: str,
+    image_motion_direction: str,
+    image_motion_amount: int,
+    clip_speed: float,
+    threads: int,
+) -> str:
+    """Render one scene to exactly `frames` frames at 30fps and
+    publish it atomically (0644, so PHP can read it over the bind
+    mount). Stock video loops or trims; stock images go through
+    the existing image-motion renderer retargeted to frames and
+    are then trimmed to the exact count; empty scenes are a solid
+    lavfi color."""
+    scene_id = str(scene.scene_id)
+    timeout_seconds = min(600.0, 30.0 + (frames / _SCENE_TIMELINE_FPS) * 10.0)
+    fit = _scene_fit_filter(width, height, fit_mode)
+    encode = [
+        "-frames:v", str(frames),
+        "-an",
+        "-threads", str(threads or 2),
+        "-pix_fmt", "yuv420p",
+    ]
+
+    def build_command(codec: str, staged: str) -> list[str]:
+        base = [utils.get_ffmpeg_binary(), "-nostdin", "-y"]
+        if scene.source == "empty":
+            color = "0x" + str(scene.background_color or "#000000").lstrip("#")
+            return base + [
+                "-f", "lavfi",
+                "-i", f"color=c={color}:s={width}x{height}:r={_SCENE_TIMELINE_FPS}",
+                "-vf", _BT709_VIDEO_FILTER,
+                "-c:v", codec,
+            ] + encode + [staged]
+
+        local_videos_dir = utils.storage_dir("local_videos", create=True)
+        if not os.path.isfile(os.path.join(local_videos_dir, str(scene.file or ""))):
+            raise RuntimeError(
+                f"scene {scene_id}: footage file not found: {scene.file}"
+            )
+        try:
+            source_path = file_security.resolve_path_within_directory(
+                local_videos_dir, str(scene.file or "")
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                f"scene {scene_id}: unsafe scene file {scene.file!r}"
+            ) from exc
+
+        if utils.parse_extension(source_path) in const.FILE_TYPE_IMAGES:
+            rendered = render_image_zoom_video(
+                source_path,
+                image_motion=image_motion,
+                zoom_direction=image_zoom_direction,
+                motion_direction=image_motion_direction,
+                motion_amount=image_motion_amount,
+                duration_frames=frames,
+                output_dir=os.path.dirname(segment_path),
+            )
+            # The motion render targets the frame count; loop+trim
+            # here makes it exact even on a floating-point edge.
+            return base + [
+                "-stream_loop", "-1",
+                "-i", rendered,
+                "-vf", f"{fit},fps={_SCENE_TIMELINE_FPS},setsar=1,{_BT709_VIDEO_FILTER}",
+                "-c:v", codec,
+            ] + encode + [staged]
+
+        speed = utils.normalize_clip_speed(clip_speed)
+        speed_filter = f"setpts=PTS/{speed}," if speed != 1.0 else ""
+        return base + [
+            "-stream_loop", "-1",
+            "-i", source_path,
+            "-vf", f"{speed_filter}{fit},fps={_SCENE_TIMELINE_FPS},setsar=1,{_BT709_VIDEO_FILTER}",
+            "-c:v", codec,
+        ] + encode + [staged]
+
+    descriptor, staged_path = tempfile.mkstemp(
+        prefix=".scene-segment-",
+        suffix=".mp4",
+        dir=os.path.dirname(os.path.abspath(segment_path)),
+    )
+    os.close(descriptor)
+    try:
+        effective_codec = _get_effective_video_codec()
+        try:
+            _run_scene_ffmpeg(
+                build_command(effective_codec, staged_path), scene_id, timeout_seconds
+            )
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            if effective_codec == _DEFAULT_VIDEO_CODEC:
+                raise
+            _run_scene_ffmpeg(
+                build_command(_DEFAULT_VIDEO_CODEC, staged_path),
+                scene_id,
+                timeout_seconds,
+            )
+            _disable_runtime_video_codec(effective_codec, str(exc))
+        if os.path.getsize(staged_path) == 0:
+            raise RuntimeError(f"scene {scene_id}: ffmpeg produced no output")
+        os.replace(staged_path, segment_path)
+        staged_path = ""
+        os.chmod(segment_path, 0o644)
+        return segment_path
+    finally:
+        if staged_path:
+            delete_files(staged_path)
+
+
+def combine_scene_timeline(
+    combined_video_path: str,
+    scenes,
+    audio_file: str,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    video_fit_mode: VideoFitMode = VideoFitMode.cover,
+    image_motion: ImageMotion = ImageMotion.zoom,
+    image_zoom_direction: str = "in",
+    image_motion_direction: str = "random",
+    image_motion_amount: int = 3,
+    clip_speed: float = 1.0,
+    threads: int = 2,
+    progress_callback: Callable[[float], None] | None = None,
+) -> str:
+    """Exact-duration combine for a scene timeline: every scene
+    renders once, in order, at its exact frame count (cumulative
+    rounding at 30fps) — no slicing, shuffling, or loop-to-cover.
+    Writes the same silent combined intermediate as
+    combine_videos. A missing or unreadable scene file fails
+    loudly with the scene id; nothing is silently skipped."""
+    scenes = list(scenes or [])
+    if not scenes:
+        raise ValueError("scene_timeline must contain at least one scene")
+
+    frame_counts = _scene_frame_counts([int(scene.duration_ms) for scene in scenes])
+    for scene, frames in zip(scenes, frame_counts):
+        if frames < 1:
+            raise ValueError(
+                f"scene {scene.scene_id}: duration {scene.duration_ms}ms "
+                "rounds to zero frames"
+            )
+
+    aspect = VideoAspect(video_aspect)
+    fit_mode = VideoFitMode(video_fit_mode)
+    video_width, video_height = aspect.to_resolution()
+    output_dir = os.path.dirname(os.path.abspath(combined_video_path))
+    total_ms = sum(int(scene.duration_ms) for scene in scenes)
+    logger.info(
+        f"scene timeline: {len(scenes)} scenes, {total_ms}ms, "
+        f"{sum(frame_counts)} frames at {_SCENE_TIMELINE_FPS}fps"
+    )
+
+    segment_dir = tempfile.mkdtemp(prefix=".scene-segments-", dir=output_dir)
+    segment_files: List[str] = []
+    try:
+        for index, (scene, frames) in enumerate(zip(scenes, frame_counts)):
+            segment_path = os.path.join(segment_dir, f"scene-{index:04d}.mp4")
+            _render_scene_segment(
+                scene,
+                frames,
+                segment_path=segment_path,
+                width=video_width,
+                height=video_height,
+                fit_mode=fit_mode,
+                image_motion=image_motion,
+                image_zoom_direction=image_zoom_direction,
+                image_motion_direction=image_motion_direction,
+                image_motion_amount=image_motion_amount,
+                clip_speed=clip_speed,
+                threads=threads,
+            )
+            segment_files.append(segment_path)
+            if progress_callback is not None:
+                try:
+                    progress_callback((index + 1) / len(scenes))
+                except Exception as exc:
+                    logger.warning(
+                        "failed to report scene progress: "
+                        f"error={type(exc).__name__}, detail={exc}"
+                    )
+
+        concat_video_clips_with_ffmpeg(
+            segment_files, combined_video_path, threads, output_dir
+        )
+        os.chmod(combined_video_path, 0o644)
+        return combined_video_path
+    finally:
+        delete_files(segment_files)
+        try:
+            os.rmdir(segment_dir)
+        except OSError:
+            pass
+
+
 def wrap_text(text, max_width, font="Arial", fontsize=60, *, shaped=None, fallbacks=None):
     # 字幕换行必须在真正创建 TextClip 前完成，否则 MoviePy 只会按原始文本
     # 计算渲染区域。这里用 PIL 按当前字体和字号测量宽度，确保每一行都尽量
@@ -2137,6 +2391,8 @@ def render_image_zoom_video(
     image_path: str, clip_duration: int = 5, image_motion: ImageMotion = ImageMotion.zoom,
     zoom_direction: str = "in", motion_direction: str = "random",
     motion_amount: int = 3,
+    duration_frames: int | None = None,
+    output_dir: str | None = None,
 ) -> str:
     """
     将单张图片渲染为静止、缓慢缩放或平移的 mp4 片段，返回输出文件路径。
@@ -2170,8 +2426,13 @@ def render_image_zoom_video(
     motion_amount = max(0, min(30, motion_amount))
     amount_fraction = motion_amount / 100.0
 
+    # Scene-timeline renders target an exact frame count at 30fps
+    # instead of whole seconds; the motion math is unchanged.
+    effective_duration = (
+        duration_frames / _SCENE_TIMELINE_FPS if duration_frames else clip_duration
+    )
     clip, _ = _open_image_clip_with_fallback(image_path)
-    clip = clip.with_duration(clip_duration).with_position("center")
+    clip = clip.with_duration(effective_duration).with_position("center")
     temp_path = ""
     try:
         # 缩放/平移模式以亚像素精度逐帧变换，静止模式保留原始构图及透明背景处理。
@@ -2196,7 +2457,11 @@ def render_image_zoom_video(
             if clip.mask is not None:
                 source_digest.update(clip.mask.get_frame(0).tobytes())
             source_identity = source_digest.hexdigest()
-            duration_identity = hashlib.sha256(str(clip_duration).encode()).hexdigest()[:16]
+            duration_identity = hashlib.sha256(
+                f"frames:{duration_frames}".encode()
+                if duration_frames
+                else str(clip_duration).encode()
+            ).hexdigest()[:16]
             motion_tag = _ZOOM_CACHE_TAG if motion == ImageMotion.zoom else ""
             # 解析后的方向和幅度也是渲染内容的一部分：同一张图以不同方向
             # 或幅度渲染时必须落在不同文件，否则后一次会覆盖前一次（循环
@@ -2208,7 +2473,7 @@ def render_image_zoom_video(
             else:
                 params_tag = ""
             video_file = os.path.join(
-                os.path.dirname(image_path),
+                output_dir or os.path.dirname(image_path),
                 f"{source_identity}.{motion.value}{motion_tag}{params_tag}-{duration_identity}.mp4",
             )
             descriptor, temp_path = tempfile.mkstemp(
