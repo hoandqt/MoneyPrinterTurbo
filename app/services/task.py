@@ -362,6 +362,45 @@ def _stage_progress_reporter(task_id: str, stage_start: float, stage_end: float)
     return report
 
 
+def _adjust_scene_timeline_to_audio(scenes, audio_file):
+    """Reconcile a scene timeline with the actual narration file:
+    the SRT last-cue end and the audio file can differ by a
+    trailing fraction. A delta within 1000ms extends or trims
+    only the last scene (never below one frame); anything larger
+    means the timeline does not describe this narration and the
+    task fails at combine with both numbers."""
+    from moviepy import AudioFileClip
+
+    audio_clip = AudioFileClip(audio_file)
+    try:
+        audio_ms = int(round(float(audio_clip.duration) * 1000))
+    finally:
+        video.close_clip(audio_clip)
+
+    total_ms = sum(int(scene.duration_ms) for scene in scenes)
+    delta_ms = audio_ms - total_ms
+    if abs(delta_ms) > 1000:
+        raise ValueError(
+            f"scene timeline totals {total_ms}ms but narration audio "
+            f"is {audio_ms}ms (delta {delta_ms}ms exceeds 1000ms)"
+        )
+    if delta_ms == 0:
+        return scenes
+
+    adjusted = list(scenes)
+    last = adjusted[-1]
+    # 34ms is the smallest duration that still rounds to a frame
+    # under cumulative rounding at 30fps.
+    adjusted[-1] = last.model_copy(
+        update={"duration_ms": max(34, int(last.duration_ms) + delta_ms)}
+    )
+    logger.info(
+        f"scene timeline adjusted to audio: last scene "
+        f"{last.duration_ms}ms -> {adjusted[-1].duration_ms}ms (delta {delta_ms}ms)"
+    )
+    return adjusted
+
+
 def generate_script(task_id, params):
     logger.info("\n\n## generating video script")
     video_script = params.video_script.strip()
@@ -1126,22 +1165,46 @@ def generate_final_videos(
         # 每条视频占 50% 进度中的一份，合成与最终编码各占一半。片段处理是
         # 合成里最耗时的部分，逐段推进这一半的进度。
         combine_share = 50 / params.video_count / 2
-        video.combine_videos(
-            combined_video_path=combined_video_path,
-            video_paths=downloaded_videos,
-            audio_file=audio_file,
-            video_aspect=params.video_aspect,
-            video_fit_mode=params.video_fit_mode,
-            video_concat_mode=video_concat_mode,
-            video_transition_mode=video_transition_mode,
-            max_clip_duration=params.video_clip_duration,
-            threads=params.n_threads,
-            clip_speed=params.video_clip_speed,
-            progress_callback=_stage_progress_reporter(
-                task_id, _progress, _progress + combine_share
-            ),
-            **batch_options,
-        )
+        if params.scene_timeline:
+            # Scene Templates: render the approved scenes at their
+            # exact durations; the legacy slice/shuffle combine
+            # would destroy the timeline. Materials were already
+            # downloaded/staged by the materials stage as today.
+            video.combine_scene_timeline(
+                combined_video_path=combined_video_path,
+                scenes=_adjust_scene_timeline_to_audio(
+                    params.scene_timeline, audio_file
+                ),
+                audio_file=audio_file,
+                video_aspect=params.video_aspect,
+                video_fit_mode=params.video_fit_mode,
+                image_motion=params.image_motion,
+                image_zoom_direction=params.image_zoom_direction,
+                image_motion_direction=params.image_motion_direction,
+                image_motion_amount=params.image_motion_amount,
+                clip_speed=params.video_clip_speed,
+                threads=params.n_threads,
+                progress_callback=_stage_progress_reporter(
+                    task_id, _progress, _progress + combine_share
+                ),
+            )
+        else:
+            video.combine_videos(
+                combined_video_path=combined_video_path,
+                video_paths=downloaded_videos,
+                audio_file=audio_file,
+                video_aspect=params.video_aspect,
+                video_fit_mode=params.video_fit_mode,
+                video_concat_mode=video_concat_mode,
+                video_transition_mode=video_transition_mode,
+                max_clip_duration=params.video_clip_duration,
+                threads=params.n_threads,
+                clip_speed=params.video_clip_speed,
+                progress_callback=_stage_progress_reporter(
+                    task_id, _progress, _progress + combine_share
+                ),
+                **batch_options,
+            )
         if allocate_batch_materials:
             selected_sources = list(dict.fromkeys(used_video_paths))
             reused_sources = [file for file in selected_sources if source_usage.get(file, 0)]
